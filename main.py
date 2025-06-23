@@ -10,7 +10,7 @@ from PyQt6.QtGui import (
     QAction, QIcon, QPen, QColor, QPainter, QPixmap, QPainterPath,
     QUndoStack, QUndoCommand
 )
-from PyQt6.QtCore import Qt, QDir, QPointF, QRectF, QSize
+from PyQt6.QtCore import Qt, QDir, QPointF, QRectF, QSize, QSizeF, QSettings
 
 # --- アンドゥ/リドゥ用のコマンドクラス ---
 class AddCommand(QUndoCommand):
@@ -25,7 +25,8 @@ class AddCommand(QUndoCommand):
         self.scene.removeItem(self.item)
 
     def redo(self):
-        self.scene.addItem(self.item)
+        if self.item.scene() is None:
+            self.scene.addItem(self.item)
 
 class RemoveCommand(QUndoCommand):
     """複数の線画アイテムを削除するコマンド（消しゴム用）"""
@@ -37,11 +38,13 @@ class RemoveCommand(QUndoCommand):
 
     def undo(self):
         for item in self.items:
-            self.scene.addItem(item)
+            if item.scene() is None:
+                self.scene.addItem(item)
 
     def redo(self):
         for item in self.items:
-            self.scene.removeItem(item)
+            if item.scene() == self.scene:
+                 self.scene.removeItem(item)
 
 # --- 描画用シーンクラス (アンドゥ/リドゥ対応) ---
 class DrawingScene(QGraphicsScene):
@@ -89,25 +92,21 @@ class DrawingScene(QGraphicsScene):
             self.last_path_item = None
 
     def erase_at(self, position):
-        radius = self.pen_size / 2.0 # 消しゴムの半径
-        erase_rect = QRectF(position - QPointF(radius, radius), QSize(int(radius*2), int(radius*2)))
+        radius = self.pen_size / 2.0
+        erase_rect = QRectF(position - QPointF(radius, radius), QSizeF(radius*2, radius*2))
         items_to_erase = [item for item in self.items(erase_rect) if isinstance(item, QGraphicsPathItem)]
         
         if items_to_erase:
-            command = RemoveCommand(self, items_to_erase)
+            command = RemoveCommand(self, list(items_to_erase))
             self.undo_stack.push(command)
     
     def clear_drawing(self):
-        # QGraphicsPixmapItem (背景画像) 以外を削除
         items_to_remove = [item for item in self.items() if not isinstance(item, QGraphicsPixmapItem)]
-        if items_to_remove: # 削除するアイテムがある場合のみコマンドを生成
-            # Clear コマンドのようなものがあればそれを使うのが理想だが、ここではRemoveCommandを流用
-            # ただし、現状のRemoveCommandは複数のアイテムを一度に処理する前提
-            # ここではシンプルに個別に削除する (アンドゥスタックには積まないか、専用コマンドを作るべき)
-            # 今回は単純に削除するだけに留める
+        if items_to_remove:
              for item in items_to_remove:
                 self.removeItem(item)
-        self.undo_stack.clear() # 描画クリア時はアンドゥスタックもクリアするのが一般的
+        self.undo_stack.clear()
+
 
 # --- メインウィンドウ ---
 class MainWindow(QMainWindow):
@@ -118,8 +117,49 @@ class MainWindow(QMainWindow):
         self.background_item = None
         self.save_dir = None
         self.undo_stack = QUndoStack(self)
+        self.image_folder_path = None
+        # ### 状態管理: processed_mapは保存済みとスキップ済みの両方を管理します
+        # 保存済み: {元ファイルパス: "保存ファイル名.png"}
+        # スキップ済み: {元ファイルパス: "_SKIPPED_"}
+        self.processed_map = {}
+
         self.init_ui()
         self.create_actions_and_shortcuts()
+        self.init_settings()
+        self.load_settings()
+
+    def init_settings(self):
+        """設定オブジェクトを初期化する"""
+        self.settings = QSettings("MyCompany", "PaintTrainMaker")
+
+    def closeEvent(self, event):
+        """ウィンドウが閉じられるときに設定を保存する"""
+        self.save_settings()
+        super().closeEvent(event)
+
+    def load_settings(self):
+        """起動時に前回終了時の設定を読み込む"""
+        self.statusBar().showMessage("前回終了時の設定を読み込んでいます...")
+        self.save_dir = self.settings.value("save_dir", None)
+        if self.save_dir:
+            self.statusBar().showMessage(f"保存先フォルダ: {self.save_dir}")
+        
+        self.processed_map = self.settings.value("processed_map", {}, type=dict)
+
+        last_folder = self.settings.value("last_folder_path", None)
+        if last_folder and os.path.isdir(last_folder):
+            self.load_folder(last_folder)
+        else:
+            self.statusBar().showMessage("準備完了。フォルダを開いてください。")
+
+    def save_settings(self):
+        """現在の手作業状態を設定に保存する"""
+        if self.image_folder_path:
+            self.settings.setValue("last_folder_path", self.image_folder_path)
+        if self.save_dir:
+            self.settings.setValue("save_dir", self.save_dir)
+        
+        self.settings.setValue("processed_map", self.processed_map)
 
     def init_ui(self):
         self.setWindowTitle("学習データセット作成支援アプリ")
@@ -194,12 +234,19 @@ class MainWindow(QMainWindow):
         nav_layout.addWidget(self.prev_button)
         nav_layout.addWidget(self.next_button)
 
+        ### スキップ機能追加: UI要素の作成 ###
+        self.skip_button = QPushButton("スキップ (Ctrl+D)")
+        self.skip_button.setStyleSheet("background-color: #E74C3C; color: white;") # 赤系の目立つ色
+        self.skip_button.clicked.connect(self.skip_image)
+
         self.save_button = QPushButton("保存 (Ctrl+S)")
         self.save_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         self.save_button.clicked.connect(self.save_dataset_pair)
 
         file_layout.addWidget(self.file_list_widget)
         file_layout.addLayout(nav_layout)
+        ### スキップ機能追加: レイアウトへの追加 ###
+        file_layout.addWidget(self.skip_button)
         file_layout.addWidget(self.save_button)
 
         self.setStatusBar(QStatusBar(self))
@@ -229,14 +276,14 @@ class MainWindow(QMainWindow):
         fit_view_action = QAction("全体表示", self, shortcut="Ctrl+0", triggered=self.fit_to_view)
         view_menu.addActions([zoom_in_action, zoom_out_action, fit_view_action])
 
-        # ショートカットキーの重複を避けるため、QPushButtonに直接関連付けられているものはaddActionしない
-        # QAction経由で統一するか、QPushButtonのショートカット設定を活かす
         shortcut_actions = [
             ("Ctrl+S", self.save_dataset_pair),
-            (Qt.Key.Key_Left, self.show_prev_image), # Qt.Key.Key_Left を使用
-            (Qt.Key.Key_Right, self.show_next_image),# Qt.Key.Key_Right を使用
-            (Qt.Key.Key_B, self.pen_button.click),    # Qt.Key.Key_B を使用
-            (Qt.Key.Key_E, self.eraser_button.click)  # Qt.Key.Key_E を使用
+            ### スキップ機能追加: ショートカットの定義 ###
+            ("Ctrl+D", self.skip_image),
+            (Qt.Key.Key_Left, self.show_prev_image),
+            (Qt.Key.Key_Right, self.show_next_image),
+            (Qt.Key.Key_B, self.pen_button.click),
+            (Qt.Key.Key_E, self.eraser_button.click)
         ]
         for key, method in shortcut_actions:
             action = QAction(self)
@@ -244,24 +291,23 @@ class MainWindow(QMainWindow):
             action.triggered.connect(method)
             self.addAction(action)
 
-
     def wheelEvent(self, event):
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             angle = event.angleDelta().y()
             factor = 1.15 if angle > 0 else 1 / 1.15
             self.canvas_view.scale(factor, factor)
         else:
-            super().wheelEvent(event) # 通常のスクロールイベントを親クラスに渡す
+            super().wheelEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
             self.canvas_view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-        super().keyPressEvent(event) # 他のキーイベント処理のために呼び出す
+        super().keyPressEvent(event)
     
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
             self.canvas_view.setDragMode(QGraphicsView.DragMode.NoDrag)
-        super().keyReleaseEvent(event) # 他のキーイベント処理のために呼び出す
+        super().keyReleaseEvent(event)
 
     def zoom_in(self):
         self.canvas_view.scale(1.2, 1.2)
@@ -271,7 +317,7 @@ class MainWindow(QMainWindow):
     
     def fit_to_view(self):
         if self.scene.sceneRect().isEmpty():
-            if self.background_item: # 背景があればそれに合わせる
+            if self.background_item:
                  self.canvas_view.fitInView(self.background_item, Qt.AspectRatioMode.KeepAspectRatio)
             return
         self.canvas_view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -293,7 +339,7 @@ class MainWindow(QMainWindow):
         self.scene.is_eraser_mode = True
         self.pen_button.setChecked(False)
         self.eraser_button.setChecked(True)
-        self.color_button.setEnabled(False) # 消しゴムモードでは色は関係ないので無効化
+        self.color_button.setEnabled(False)
         self.statusBar().showMessage("消しゴムツールを選択しました。")
 
     def change_pen_size(self, value):
@@ -310,60 +356,83 @@ class MainWindow(QMainWindow):
     def update_color_button_style(self, color):
         self.color_button.setStyleSheet(f"background-color: {color.name()}; color: {'white' if color.lightnessF() < 0.5 else 'black'};")
 
-
     def change_background_opacity(self, value):
         if self.background_item:
             self.background_item.setOpacity(value / 100.0)
             self.statusBar().showMessage(f"背景の不透明度: {value}%")
 
     def open_folder_dialog(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "画像フォルダを選択", self.save_dir or QDir.homePath())
+        start_dir = self.image_folder_path or self.save_dir or QDir.homePath()
+        dir_path = QFileDialog.getExistingDirectory(self, "画像フォルダを選択", start_dir)
         if dir_path:
-            self.image_files = []
-            self.file_list_widget.clear()
-            self.current_image_index = -1 # インデックスをリセット
-            self.scene.clear_drawing() # シーンの描画内容をクリア
-            if self.background_item: # 古い背景画像を削除
-                self.scene.removeItem(self.background_item)
-                self.background_item = None
-            self.scene.setSceneRect(QRectF()) # シーンの矩形をリセット
+            if dir_path != self.image_folder_path:
+                self.processed_map.clear()
+            self.load_folder(dir_path)
 
-            supported_formats = [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff"] # 対応フォーマットを追加
-            try:
-                for filename in sorted(os.listdir(dir_path)):
-                    if any(filename.lower().endswith(fmt) for fmt in supported_formats):
-                        full_path = os.path.join(dir_path, filename)
-                        self.image_files.append(full_path)
-                        item = QListWidgetItem(os.path.basename(filename))
-                        self.file_list_widget.addItem(item)
-            except OSError as e:
-                QMessageBox.warning(self, "エラー", f"フォルダの読み込みに失敗しました: {e}")
-                self.statusBar().showMessage("フォルダの読み込みに失敗しました。")
-                return
+    def load_folder(self, dir_path):
+        """指定されたパスから画像ファイルを読み込み、リストに表示する"""
+        self.image_folder_path = dir_path
+        self.image_files = []
+        self.file_list_widget.clear()
+        self.current_image_index = -1
+        self.scene.clear_drawing()
+        if self.background_item:
+            self.scene.removeItem(self.background_item)
+            self.background_item = None
+        self.scene.setSceneRect(QRectF())
 
-            if self.image_files:
-                self.file_list_widget.setCurrentRow(0) # 最初の画像を選択状態にする
-                # on_file_selected が呼ばれるので load_image_to_canvas も実行される
-                self.statusBar().showMessage(f"{len(self.image_files)}個の画像を読み込みました。")
-            else:
-                self.statusBar().showMessage("選択されたフォルダにサポートされている画像ファイルが見つかりませんでした。")
-                QMessageBox.information(self, "情報", "選択されたフォルダにサポートされている画像ファイルが見つかりませんでした。")
+        supported_formats = [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff"]
+        try:
+            for filename in sorted(os.listdir(dir_path)):
+                if any(filename.lower().endswith(fmt) for fmt in supported_formats):
+                    full_path = os.path.join(dir_path, filename)
+                    self.image_files.append(full_path)
+                    
+                    base_filename = os.path.basename(filename)
+                    item = QListWidgetItem(base_filename)
+                    
+                    ### スキップ機能修正: 処理済みファイルの表示分け ###
+                    if full_path in self.processed_map:
+                        status = self.processed_map[full_path]
+                        if status == "_SKIPPED_":
+                            item.setText(f"⊘ {base_filename} (スキップ)")
+                            item.setForeground(QColor("darkGray"))
+                        else:
+                            # 保存済みの場合はファイル名(status)を表示するより、マークで示す方が簡潔
+                            item.setText(f"✓ {base_filename} (保存済)")
+                            item.setForeground(QColor("gray"))
 
+                    self.file_list_widget.addItem(item)
+        except OSError as e:
+            QMessageBox.warning(self, "エラー", f"フォルダの読み込みに失敗しました: {e}")
+            self.statusBar().showMessage("フォルダの読み込みに失敗しました。")
+            return
+
+        if self.image_files:
+            first_unprocessed_index = -1
+            for i, f_path in enumerate(self.image_files):
+                if f_path not in self.processed_map:
+                    first_unprocessed_index = i
+                    break
+            
+            select_index = 0 if first_unprocessed_index == -1 else first_unprocessed_index
+            if self.file_list_widget.count() > select_index:
+                self.file_list_widget.setCurrentRow(select_index)
+            
+            self.statusBar().showMessage(f"{len(self.image_files)}個の画像を読み込みました。")
+        else:
+            self.statusBar().showMessage("選択されたフォルダにサポートされている画像ファイルが見つかりませんでした。")
+            QMessageBox.information(self, "情報", "選択されたフォルダにサポートされている画像ファイルが見つかりませんでした。")
 
     def on_file_selected(self, current_item, previous_item):
         if current_item is None:
-            # self.scene.clear_drawing() # 何も選択されていない場合はクリア
-            # if self.background_item:
-            #     self.scene.removeItem(self.background_item)
-            #     self.background_item = None
-            # self.scene.setSceneRect(QRectF())
             return
         index = self.file_list_widget.row(current_item)
-        if 0 <= index < len(self.image_files): # index が有効範囲内か確認
-            if index != self.current_image_index: # 実際に選択が変更された場合のみロード
+        if 0 <= index < len(self.image_files):
+            if index != self.current_image_index:
                 self.current_image_index = index
                 self.load_image_to_canvas()
-        else: # リストがクリアされた場合など current_item があるが index が不正な場合
+        else:
             self.current_image_index = -1
             self.scene.clear_drawing()
             if self.background_item:
@@ -376,29 +445,28 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("表示する画像がありません。")
             return
             
-        self.undo_stack.clear() # 新しい画像なのでアンドゥスタックをクリア
-        self.scene.clear_drawing() # 既存の描画（線画）をクリア
+        self.undo_stack.clear()
+        self.scene.clear_drawing()
         
         image_path = self.image_files[self.current_image_index]
         pixmap = QPixmap(image_path)
         if pixmap.isNull():
             self.statusBar().showMessage(f"エラー: 画像を読み込めません {os.path.basename(image_path)}")
             QMessageBox.warning(self, "読込エラー", f"画像を読み込めませんでした:\n{image_path}")
-            # 不正な画像をリストから削除するなどの処理も考えられる
             return
             
-        if self.background_item: # 既存の背景アイテムがあれば削除
+        if self.background_item:
             self.scene.removeItem(self.background_item)
-            self.background_item = None # 参照をクリア
+            self.background_item = None
         
         self.background_item = QGraphicsPixmapItem(pixmap)
         self.background_item.setOpacity(self.opacity_slider.value() / 100.0)
-        self.background_item.setZValue(-1) # 描画アイテムより奥に配置
+        self.background_item.setZValue(-1)
         self.scene.addItem(self.background_item)
-        self.scene.setSceneRect(self.background_item.boundingRect()) # シーンの大きさを背景画像に合わせる
+        self.scene.setSceneRect(self.background_item.boundingRect())
         
         self.fit_to_view()
-        self.activate_pen_tool() # 新しい画像を開いたらペンツールをデフォルトにする
+        self.activate_pen_tool()
         self.statusBar().showMessage(f"表示中: {os.path.basename(image_path)}")
 
     def show_prev_image(self):
@@ -406,22 +474,45 @@ class MainWindow(QMainWindow):
         current_row = self.file_list_widget.currentRow()
         if current_row > 0:
             self.file_list_widget.setCurrentRow(current_row - 1)
-        # currentItemChangedシグナルにより on_file_selected -> load_image_to_canvas が呼ばれる
 
     def show_next_image(self):
         if self.file_list_widget.count() == 0: return
         current_row = self.file_list_widget.currentRow()
         if current_row < self.file_list_widget.count() - 1:
             self.file_list_widget.setCurrentRow(current_row + 1)
-        # currentItemChangedシグナルにより on_file_selected -> load_image_to_canvas が呼ばれる
-    
+
+    ### スキップ機能追加: スキップ処理を行うメソッド ###
+    def skip_image(self):
+        """現在の画像をスキップとしてマークし、次の画像へ移動する。"""
+        if self.current_image_index < 0 or not self.image_files:
+            QMessageBox.warning(self, "スキップエラー", "スキップ対象の画像が選択されていません。")
+            return
+
+        current_image_path = self.image_files[self.current_image_index]
+
+        # processed_map にスキップ情報を記録 ("_SKIPPED_" は特別なフラグ)
+        self.processed_map[current_image_path] = "_SKIPPED_"
+        
+        # 変更を永続化するために設定に即時保存
+        self.settings.setValue("processed_map", self.processed_map)
+
+        # QListWidget の表示を更新
+        list_widget_item = self.file_list_widget.item(self.current_image_index)
+        if list_widget_item:
+            base_filename = os.path.basename(current_image_path)
+            list_widget_item.setText(f"⊘ {base_filename} (スキップ)")
+            list_widget_item.setForeground(QColor("darkGray"))
+
+        self.statusBar().showMessage(f"{os.path.basename(current_image_path)} をスキップしました。")
+        
+        # 次の画像へ移動
+        self.show_next_image()
+
     def save_dataset_pair(self):
         if self.current_image_index < 0 or not self.image_files:
-            self.statusBar().showMessage("保存対象の画像が選択されていません。")
             QMessageBox.warning(self, "保存エラー", "保存対象の画像が選択されていません。")
             return
-        if not self.background_item: # 背景画像がロードされていない場合
-            self.statusBar().showMessage("背景画像がロードされていません。")
+        if not self.background_item:
             QMessageBox.warning(self, "保存エラー", "背景画像がロードされていません。")
             return
 
@@ -430,9 +521,9 @@ class MainWindow(QMainWindow):
             if not self.save_dir:
                 self.statusBar().showMessage("保存がキャンセルされました。")
                 return
-            else: # 保存先フォルダが設定されたら、ステータスバーに表示などしても良い
-                self.statusBar().showMessage(f"保存先フォルダ: {self.save_dir}")
-
+        
+        self.settings.setValue("save_dir", self.save_dir)
+        self.statusBar().showMessage(f"保存先フォルダ: {self.save_dir}")
 
         input_dir = os.path.join(self.save_dir, "input")
         target_dir = os.path.join(self.save_dir, "target")
@@ -441,104 +532,71 @@ class MainWindow(QMainWindow):
             os.makedirs(target_dir, exist_ok=True)
         except OSError as e:
             QMessageBox.critical(self, "保存エラー", f"保存フォルダの作成に失敗しました: {e}")
-            self.statusBar().showMessage(f"保存フォルダの作成に失敗: {e}")
             return
         
-        # --- ここから修正されたファイル名生成ロジック ---
         next_index = 0
-        existing_indices = set() # 重複を避けるためにセットを使用
-
-        # input_dir をスキャン
+        existing_indices = set()
         if os.path.exists(input_dir):
             for f_name in os.listdir(input_dir):
-                # PNGファイルのみを対象とし、ファイル名が数値であることを確認
                 base, ext = os.path.splitext(f_name)
                 if ext.lower() == ".png" and base.isdigit():
                     existing_indices.add(int(base))
-        
-        # target_dir をスキャン (input_dir と同期しているはずだが、念のため両方確認)
         if os.path.exists(target_dir):
             for f_name in os.listdir(target_dir):
                 base, ext = os.path.splitext(f_name)
                 if ext.lower() == ".png" and base.isdigit():
                     existing_indices.add(int(base))
-        
         if existing_indices:
             next_index = max(existing_indices) + 1
+        base_name = f"{next_index:05d}.png"
         
-        base_name = f"{next_index:05d}.png" # 5桁ゼロ埋め
-        # --- ここまで修正されたファイル名生成ロジック ---
-        
-        original_pixmap = QPixmap(self.image_files[self.current_image_index])
+        current_image_path = self.image_files[self.current_image_index]
+        original_pixmap = QPixmap(current_image_path)
         if original_pixmap.isNull():
             QMessageBox.critical(self, "保存エラー", "元の画像の読み込みに失敗しました。")
-            self.statusBar().showMessage("元の画像の読み込みに失敗しました。")
             return
 
-        # input画像の保存 (PNG形式)
         if not original_pixmap.save(os.path.join(input_dir, base_name), "PNG"):
             QMessageBox.critical(self, "保存エラー", f"Input画像 ({base_name}) の保存に失敗しました。")
-            self.statusBar().showMessage(f"Input画像 ({base_name}) の保存に失敗しました。")
             return
         
-        self.background_item.hide() # target画像生成のために背景を一時的に隠す
-        
-        # 描画領域を取得
-        # itemsBoundingRect は描画アイテムのみのバウンディングボックス
-        # sceneRect は背景画像に合わせたシーン全体の矩形
-        # ここでは描画内容を保存するので itemsBoundingRect を基本とするが、
-        # 何も描かれていない場合は背景画像と同じサイズの透明画像とする
+        self.background_item.hide()
         render_rect = self.scene.itemsBoundingRect()
-        if render_rect.isNull() or render_rect.isEmpty(): # 何も描画されていない場合
-            # 背景画像のサイズで透明なtarget画像を作成
+        if render_rect.isNull() or render_rect.isEmpty():
             target_size = self.background_item.pixmap().size()
-            render_rect = QRectF(QPointF(0,0), target_size) # 描画元はシーンの(0,0)から背景サイズ
+            render_rect = QRectF(QPointF(0,0), QSizeF(target_size))
         else:
-            # 描画内容が存在する場合、そのバウンディングボックスのサイズにする
             target_size = render_rect.size().toSize()
-
-
         if target_size.width() <= 0 or target_size.height() <= 0:
-             # フォールバックとして元の画像のサイズを使う (ほぼありえないが念のため)
             target_size = original_pixmap.size()
-            if target_size.width() <= 0 or target_size.height() <= 0: # それでもダメならエラー
-                QMessageBox.critical(self, "保存エラー", "Target画像のサイズが不正です。")
-                self.statusBar().showMessage("Target画像のサイズが不正です。")
-                self.background_item.show() # 隠した背景を戻す
-                return
-            render_rect = QRectF(QPointF(0,0), target_size) # この場合、描画元も調整が必要
-
-
+            render_rect = QRectF(QPointF(0,0), QSizeF(target_size))
         target_pixmap = QPixmap(target_size)
-        target_pixmap.fill(Qt.GlobalColor.transparent) # 透明背景で初期化
-        
+        target_pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(target_pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        # scene.render に渡す source_rect は、シーンのどの部分を切り出すか
-        # ここでは render_rect (描画アイテムのバウンディングボックスまたは背景サイズ) を指定
         self.scene.render(painter, QRectF(target_pixmap.rect()), render_rect)
         painter.end()
-        
         if not target_pixmap.save(os.path.join(target_dir, base_name), "PNG"):
             QMessageBox.critical(self, "保存エラー", f"Target画像 ({base_name}) の保存に失敗しました。")
-            self.statusBar().showMessage(f"Target画像 ({base_name}) の保存に失敗しました。")
-            self.background_item.show() # 隠した背景を戻す
-            # 既に保存したinput画像を削除するロールバック処理も考えられる
-            # os.remove(os.path.join(input_dir, base_name))
+            os.remove(os.path.join(input_dir, base_name)) # ロールバック
+            self.background_item.show()
             return
         
-        self.background_item.show() # 隠した背景を戻す
-        
+        self.background_item.show()
         self.statusBar().showMessage(f"{base_name} として input/target ペアを保存しました。")
         
-        # リストアイテムに進捗マークを付ける
+        self.processed_map[current_image_path] = base_name
+        self.settings.setValue("processed_map", self.processed_map)
+
+        ### スキップ機能修正: リストアイテムの表示更新を堅牢化 ###
+        # スキップ済みであっても、保存時に正しく表示が上書きされるようにする
         list_widget_item = self.file_list_widget.item(self.current_image_index)
-        if list_widget_item and not list_widget_item.text().startswith("✓ "):
-            list_widget_item.setText(f"✓ {list_widget_item.text()}")
-            list_widget_item.setForeground(QColor("gray")) # 色をグレーに変更
+        if list_widget_item:
+            base_filename = os.path.basename(current_image_path)
+            list_widget_item.setText(f"✓ {base_filename} (保存済)")
+            list_widget_item.setForeground(QColor("gray"))
         
-        self.show_next_image() # 自動で次の画像へ
+        self.show_next_image()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
